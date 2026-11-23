@@ -2615,6 +2615,30 @@ fun AppNavigation(
                 onPendingAppShortcutNavIndexConsumed(index)
             }
         }
+        // 🎮 手柄 LB/RB 切换底栏与 Y 键回顶刷新，复用同一套底栏导航语义。
+        val latestVisibleBottomItems by rememberUpdatedState(visibleBottomBarItems)
+        val latestCurrentBottomItem by rememberUpdatedState(currentBottomNavItem)
+        val latestHandleNavItemClick by rememberUpdatedState(handleNavItemClick)
+        val latestCurrentNavKey by rememberUpdatedState(currentNavigation3Key)
+        val latestHostWindowFocused by rememberUpdatedState(hostWindowFocused)
+        LaunchedEffect(Unit) {
+            com.android.purebilibili.core.input.gamepad.GamepadControlEngine.navigationActions.collect { action ->
+                if (latestCurrentNavKey != BiliPaiNavKey.MainHost || !latestHostWindowFocused) return@collect
+                when (action) {
+                    is com.android.purebilibili.core.input.gamepad.GamepadNavigationAction.SwitchBottomTabDelta -> {
+                        val items = latestVisibleBottomItems
+                        if (items.size <= 1) return@collect
+                        val currentIndex = items.indexOf(latestCurrentBottomItem).coerceAtLeast(0)
+                        val nextIndex = Math.floorMod(currentIndex + action.delta, items.size)
+                        latestHandleNavItemClick(items[nextIndex])
+                    }
+                    com.android.purebilibili.core.input.gamepad.GamepadNavigationAction.ReselectCurrentTab -> {
+                        latestHandleNavItemClick(latestCurrentBottomItem)
+                    }
+                    else -> Unit
+                }
+            }
+        }
         fun pushSearchRouteInNavigation3(keyword: String) {
             val normalizedKeyword = keyword.trim()
             if (normalizedKeyword.isNotEmpty()) {
