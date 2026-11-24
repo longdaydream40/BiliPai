@@ -28,16 +28,24 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.android.purebilibili.core.input.gamepad.GamepadActionSlot
+import com.android.purebilibili.core.input.gamepad.GamepadConfig
 import com.android.purebilibili.core.input.gamepad.GamepadControlEngine
 import com.android.purebilibili.core.input.gamepad.GamepadControlMode
+import com.android.purebilibili.core.input.gamepad.GamepadControllerProfile
+import com.android.purebilibili.core.input.gamepad.GamepadCursorColorStyle
+import com.android.purebilibili.core.input.gamepad.GamepadKeyCodes
 import com.android.purebilibili.core.input.gamepad.GamepadScene
+import com.android.purebilibili.core.input.gamepad.formatGamepadKeyBadge
+import com.android.purebilibili.core.input.gamepad.formatTriggerPairLabels
+import com.android.purebilibili.core.input.gamepad.resolveBoundKeyCode
 import com.android.purebilibili.core.ui.components.AppText
 
 /**
  * 全局手柄视觉覆盖层（挂载于 MainActivity 与 VideoActivity 最顶层，不拦截任何触控事件）：
- * 1. 绘制丝滑虚拟光标（支持按下拖拽高亮与 LT 慢速精准瞄准态）；
+ * 1. 绘制丝滑虚拟光标（支持尺寸/配色主题、按下拖拽高亮与左扳机精准瞄准态）；
  * 2. 显示顶部轻提示条（手柄连接/断开、模式切换、倍速提示）；
- * 3. 可选底部紧凑 Xbox 键位提示 HUD（随浏览/视频详情/全屏场景自动切换）。
+ * 3. 可选底部紧凑键位提示 HUD（按当前手柄品牌 Xbox / PS / Switch 与自定义键位实时展示）。
  */
 @Composable
 fun GamepadOverlayHost(
@@ -86,7 +94,7 @@ fun GamepadOverlayHost(
             }
         }
 
-        // 2. 底部紧凑 Xbox 键位提示条（仅连接手柄且开启 HUD 时展示）
+        // 2. 底部紧凑键位提示条（仅连接手柄且在设置中开启提示栏时展示）
         val showHud = state.connected && state.hudVisible && config.showLegendHud
         AnimatedVisibility(
             visible = showHud,
@@ -97,17 +105,19 @@ fun GamepadOverlayHost(
                 .navigationBarsPadding()
                 .padding(horizontal = 12.dp, vertical = 8.dp),
         ) {
-            val hints = remember(state.scene, state.mode, state.cursorVisible) {
+            val hints = remember(state.scene, state.mode, state.cursorVisible, state.effectiveProfile, config) {
                 resolveLegendHints(
                     scene = state.scene,
                     mode = state.mode,
                     cursorVisible = state.cursorVisible,
+                    profile = state.effectiveProfile,
+                    config = config,
                 )
             }
             Row(
                 modifier = Modifier
                     .background(
-                        color = Color.Black.copy(alpha = 0.62f),
+                        color = Color.Black.copy(alpha = 0.64f),
                         shape = RoundedCornerShape(999.dp),
                     )
                     .border(
@@ -154,18 +164,23 @@ fun GamepadOverlayHost(
             val center = Offset(state.cursorX, state.cursorY)
             val pressed = state.pointerPressed
             val precision = state.precisionAimHeld
+            val scale = config.cursorSize.radiusScale
+            val idleColor = resolveCursorIdleColor(config.cursorColorStyle)
             Canvas(modifier = Modifier.fillMaxSize()) {
                 val outerRadius = when {
-                    pressed -> 13.dp.toPx()
-                    precision -> 11.dp.toPx()
-                    else -> 15.dp.toPx()
+                    pressed -> 13.dp.toPx() * scale
+                    precision -> 11.dp.toPx() * scale
+                    else -> 15.dp.toPx() * scale
                 }
                 val accentColor = when {
-                    pressed -> Color(0xFFFB7299)
+                    pressed -> if (config.cursorColorStyle == GamepadCursorColorStyle.BILI_PINK) {
+                        Color.White
+                    } else {
+                        Color(0xFFFB7299)
+                    }
                     precision -> Color(0xFF38BDF8)
-                    else -> Color.White
+                    else -> idleColor
                 }
-                // 外圈暗影提升亮色背景下的可见度
                 drawCircle(
                     color = if (pressed) {
                         Color(0xFFFB7299).copy(alpha = 0.28f * cursorAlpha)
@@ -183,7 +198,7 @@ fun GamepadOverlayHost(
                 )
                 drawCircle(
                     color = accentColor.copy(alpha = 0.96f * cursorAlpha),
-                    radius = 2.8.dp.toPx(),
+                    radius = 2.8.dp.toPx() * scale,
                     center = center,
                 )
             }
@@ -191,47 +206,76 @@ fun GamepadOverlayHost(
     }
 }
 
+private fun resolveCursorIdleColor(style: GamepadCursorColorStyle): Color = when (style) {
+    GamepadCursorColorStyle.CLASSIC_WHITE -> Color.White
+    GamepadCursorColorStyle.BILI_PINK -> Color(0xFFFB7299)
+    GamepadCursorColorStyle.CYAN -> Color(0xFF38BDF8)
+    GamepadCursorColorStyle.GOLD -> Color(0xFFFACC15)
+}
+
 private fun resolveLegendHints(
     scene: GamepadScene,
     mode: GamepadControlMode,
     cursorVisible: Boolean,
+    profile: GamepadControllerProfile,
+    config: GamepadConfig,
 ): List<Pair<String, String>> {
-    return when (scene) {
-        GamepadScene.VIDEO_FULLSCREEN -> if (cursorVisible) {
-            listOf(
-                "LS" to "光标",
-                "A" to "点击/拖",
-                "B" to "退出",
-                "RT" to "按住倍速",
-                "X" to "弹幕",
-                "L3" to "隐光标",
-            )
-        } else {
-            listOf(
-                "A" to "播/停",
-                "B" to "退出",
-                "LB/RB" to "±10s",
-                "RT" to "按住倍速",
-                "X" to "弹幕",
-                "L3" to "光标",
-            )
+    fun badge(slot: GamepadActionSlot): String? {
+        val code = resolveBoundKeyCode(config, slot, profile)
+        if (code == GamepadKeyCodes.UNBOUND) return null
+        return formatGamepadKeyBadge(code, profile)
+    }
+
+    val (_, rtBadge) = formatTriggerPairLabels(profile)
+    val confirm = badge(GamepadActionSlot.CONFIRM)
+    val back = badge(GamepadActionSlot.BACK)
+    val toggleMode = badge(GamepadActionSlot.TOGGLE_MODE)
+    val toggleCursor = badge(GamepadActionSlot.TOGGLE_CURSOR)
+
+    return buildList {
+        when (scene) {
+            GamepadScene.VIDEO_FULLSCREEN -> if (cursorVisible) {
+                add("LS" to "光标")
+                confirm?.let { add(it to "点击/拖") }
+                back?.let { add(it to "退出") }
+                add(rtBadge to "倍速")
+                badge(GamepadActionSlot.TOGGLE_DANMAKU)?.let { add(it to "弹幕") }
+                toggleCursor?.let { add(it to "隐光标") }
+            } else {
+                confirm?.let { add(it to "播/停") }
+                back?.let { add(it to "退出") }
+                val prev = badge(GamepadActionSlot.SEEK_BACKWARD)
+                val next = badge(GamepadActionSlot.SEEK_FORWARD)
+                if (prev != null && next != null) {
+                    add("$prev/$next" to "±${config.seekStepSeconds}s")
+                }
+                add(rtBadge to "倍速")
+                badge(GamepadActionSlot.TOGGLE_DANMAKU)?.let { add(it to "弹幕") }
+                toggleCursor?.let { add(it to "光标") }
+            }
+
+            GamepadScene.VIDEO_DETAIL -> {
+                add("LS" to if (mode == GamepadControlMode.CURSOR) "光标" else "焦点")
+                add("RS" to "滚动")
+                confirm?.let { add(it to "选择") }
+                back?.let { add(it to "返回") }
+                badge(GamepadActionSlot.TOGGLE_FULLSCREEN)?.let { add(it to "全屏/三连") }
+                add(rtBadge to "倍速")
+            }
+
+            GamepadScene.BROWSING -> {
+                add("LS" to if (mode == GamepadControlMode.CURSOR) "光标" else "焦点")
+                add("RS" to "滚动")
+                confirm?.let { add(it to "选择") }
+                back?.let { add(it to "返回") }
+                val prevTab = badge(GamepadActionSlot.PREV_TAB)
+                val nextTab = badge(GamepadActionSlot.NEXT_TAB)
+                if (prevTab != null && nextTab != null) {
+                    add("$prevTab/$nextTab" to "切页")
+                }
+                badge(GamepadActionSlot.OPEN_SEARCH)?.let { add(it to "搜索") }
+                toggleMode?.let { add(it to "切模式") }
+            }
         }
-        GamepadScene.VIDEO_DETAIL -> listOf(
-            "LS" to if (mode == GamepadControlMode.CURSOR) "光标" else "焦点",
-            "RS" to "滚动",
-            "A" to "选择",
-            "B" to "返回",
-            "Y" to "全屏/长按三连",
-            "RT" to "倍速",
-        )
-        GamepadScene.BROWSING -> listOf(
-            "LS" to if (mode == GamepadControlMode.CURSOR) "光标" else "焦点",
-            "RS" to "滚动",
-            "A" to "选择",
-            "B" to "返回",
-            "LB/RB" to "切页",
-            "X" to "搜索",
-            "View" to "切模式",
-        )
     }
 }

@@ -514,4 +514,14 @@ class SettingsSearchPolicyTest {
         }
     }
 
+    @Test
+    fun queryByGamepadKeywords_hitsGamepadControlModule() {
+        listOf("手柄", "PS5", "Switch", "隐藏提示栏", "自定义键位").forEach { query ->
+            assertTrue(
+                resolveSettingsSearchResults(query).any { it.target == SettingsSearchTarget.GAMEPAD_CONTROL },
+                "Expected query '$query' to match GAMEPAD_CONTROL",
+            )
+        }
+    }
+
 }

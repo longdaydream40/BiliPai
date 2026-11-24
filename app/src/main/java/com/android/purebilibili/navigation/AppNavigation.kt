@@ -5326,6 +5326,15 @@ fun AppNavigation(
                 }
 
                 @Composable
+                fun RenderGamepadControlSettingsEntryContent(key: BiliPaiNavKey) {
+                    SettingsTabletEntry(key) {
+                        com.android.purebilibili.feature.settings.GamepadControlSettingsScreen(
+                            onBack = { performSystemBackAction() }
+                        )
+                    }
+                }
+
+                @Composable
                 fun RenderAicuQueryEntryContent(key: BiliPaiNavKey) {
                     val aicuKey = key as BiliPaiNavKey.AicuQuery
                     com.android.purebilibili.feature.aicu.AicuRoute(
@@ -6616,6 +6625,8 @@ fun AppNavigation(
                             RenderTipsSettingsEntryContent(key)
                         BiliPaiNavEntryContentRole.KEYBOARD_SHORTCUTS_SETTINGS ->
                             RenderKeyboardShortcutsSettingsEntryContent(key)
+                        BiliPaiNavEntryContentRole.GAMEPAD_CONTROL_SETTINGS ->
+                            RenderGamepadControlSettingsEntryContent(key)
                         BiliPaiNavEntryContentRole.AICU_QUERY ->
                             RenderAicuQueryEntryContent(key)
                         BiliPaiNavEntryContentRole.WATCH_LATER ->

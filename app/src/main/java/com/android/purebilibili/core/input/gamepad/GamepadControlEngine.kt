@@ -22,17 +22,22 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.math.abs
+import kotlin.math.max
 
 private const val TAG = "GamepadControlEngine"
 private const val CURSOR_AUTO_HIDE_MS = 4_500L
 private const val HOVER_DISPATCH_INTERVAL_MS = 32L
-private const val LONG_PRESS_Y_MS = 520L
+private const val LONG_PRESS_FULLSCREEN_MS = 520L
 private const val FULLSCREEN_STICK_SEEK_INTERVAL_MS = 320L
 
 data class GamepadUiState(
     val pluginEnabled: Boolean = false,
     val connected: Boolean = false,
     val controllerName: String? = null,
+    val controllerVendorId: Int = 0,
+    val controllerProductId: Int = 0,
+    val detectedProfile: GamepadControllerProfile = GamepadControllerProfile.GENERIC,
+    val effectiveProfile: GamepadControllerProfile = GamepadControllerProfile.XBOX,
     val mode: GamepadControlMode = GamepadControlMode.CURSOR,
     val scene: GamepadScene = GamepadScene.BROWSING,
     val cursorVisible: Boolean = false,
@@ -42,6 +47,7 @@ data class GamepadUiState(
     val precisionAimHeld: Boolean = false,
     val hudVisible: Boolean = true,
     val rtBoostActive: Boolean = false,
+    val capturingKeyForSlot: GamepadActionSlot? = null,
     val statusBanner: String? = null,
     val statusBannerId: Long = 0L,
 )
@@ -62,12 +68,14 @@ private data class SceneRegistration(
 )
 
 /**
- * Xbox / 通用手柄全局操控引擎（单例）。
+ * 多型号手柄全局操控引擎（单例），支持 Xbox、PlayStation (PS4/PS5 DualSense/DualShock)、
+ * Nintendo Switch (Pro / Joy-Con) 以及通用蓝牙/USB 手柄。
  *
  * 特性：
- * - 双模式：默认「智能光标模式」（左摇杆移光标 + 右摇杆全局滚轮/滑动 + A 点击与拖拽 + B 回退），
- *   按 View 键可随时切换「焦点导航模式」；
- * - 场景感知：进入视频详情页或全屏播放器后自动解锁播放快捷键与按住 RT 倍速；
+ * - 自动识别手柄品牌并适配按键图标、Sony `-1..1` 扳机轴、Switch 数字 ZL/ZR 与 A/B 布局；
+ * - 双模式：默认「智能光标模式」+ 一键切换「焦点导航模式」；
+ * - 完整自定义键位映射与实体按键录制模式；
+ * - 场景感知：视频详情页与全屏页自动解锁播放快捷键与右扳机按住倍速；
  * - 多窗口穿透：自动挂接 Compose Dialog / ModalBottomSheet 窗口并同步光标；
  * - 零空闲开销：仅在摇杆偏离死区或长按连发时运行 Choreographer 帧循环。
  */
@@ -102,6 +110,9 @@ object GamepadControlEngine {
 
     private val sceneStack = CopyOnWriteArrayList<SceneRegistration>()
 
+    private var configPersistCallback: ((GamepadConfig) -> Unit)? = null
+    private var keyCaptureCallback: ((Int) -> Unit)? = null
+
     private val windowBridge = GamepadWindowBridge(
         onKeyEvent = ::handleKeyEvent,
         onGenericMotionEvent = ::handleGenericMotionEvent,
@@ -113,8 +124,13 @@ object GamepadControlEngine {
     private var cursorY = 0f
     private var leftStick = NormalizedStickVector()
     private var rightStick = NormalizedStickVector()
+    private var lockedScrollAxis: GamepadScrollAxis? = null
     private var rawHatX = 0f
     private var rawHatY = 0f
+    private var analogLeftTriggerValue = 0f
+    private var analogRightTriggerValue = 0f
+    private var digitalL2Pressed = false
+    private var digitalR2Pressed = false
     private var leftTriggerValue = 0f
     private var rightTriggerValue = 0f
     private var ltPressed = false
@@ -133,9 +149,10 @@ object GamepadControlEngine {
     private var lastFullscreenSeekMs = 0L
     private var statusBannerSeq = 0L
 
-    private var yLongPressFired = false
-    private val yLongPressRunnable = Runnable {
-        yLongPressFired = true
+    private var fullscreenLongPressFired = false
+    private var fullscreenLongPressKeyCode: Int = GamepadKeyCodes.UNBOUND
+    private val fullscreenLongPressRunnable = Runnable {
+        fullscreenLongPressFired = true
         val state = _uiState.value
         if (state.pluginEnabled && config.playerShortcutsEnabled && isVideoScene(state.scene)) {
             emitPlayerAction(GamepadPlayerAction.TripleAction)
@@ -189,6 +206,20 @@ object GamepadControlEngine {
         refreshConnectedControllers(notifyChange = false)
     }
 
+    fun setConfigPersistCallback(callback: ((GamepadConfig) -> Unit)?) {
+        configPersistCallback = callback
+    }
+
+    fun startKeyCapture(slot: GamepadActionSlot, onCaptured: (Int) -> Unit) {
+        keyCaptureCallback = onCaptured
+        _uiState.update { it.copy(capturingKeyForSlot = slot) }
+    }
+
+    fun stopKeyCapture() {
+        keyCaptureCallback = null
+        _uiState.update { it.copy(capturingKeyForSlot = null) }
+    }
+
     fun setPluginEnabled(enabled: Boolean) {
         _uiState.update { current ->
             current.copy(
@@ -217,11 +248,16 @@ object GamepadControlEngine {
             state.copy(
                 mode = if (previousMode != newConfig.defaultMode) newConfig.defaultMode else state.mode,
                 hudVisible = newConfig.showLegendHud,
+                effectiveProfile = resolveEffectiveProfile(
+                    override = newConfig.controllerProfileOverride,
+                    detected = state.detectedProfile,
+                ),
             )
         }
         if (!newConfig.autoHideCursor) {
             mainHandler.removeCallbacks(autoHideCursorRunnable)
         }
+        syncDialogOverlayIfNeeded()
     }
 
     fun attachActivity(activity: ComponentActivity) {
@@ -271,15 +307,13 @@ object GamepadControlEngine {
 
     fun handleKeyEvent(event: KeyEvent): Boolean {
         if (windowBridge.isDispatchingSynthetic) return false
-        if (!_uiState.value.pluginEnabled) return false
         if (!isGamepadKeyEvent(event)) return false
 
         val device = event.device
-        if (device != null && isHardwareGamepadDevice(device) && !_uiState.value.connected) {
-            refreshConnectedControllers(notifyChange = false)
+        if (device != null && isHardwareGamepadDevice(device)) {
+            syncActiveControllerDevice(device)
         }
 
-        // 输入法聚焦编辑框时仅拦截 B 键回退和摇杆按键，其余放行不干扰输入法选字。
         val keyCode = event.keyCode
         val isDown = event.action == KeyEvent.ACTION_DOWN
         val isUp = event.action == KeyEvent.ACTION_UP
@@ -289,12 +323,83 @@ object GamepadControlEngine {
             recordLastButton(keyCode)
         }
 
+        // 自定义键位录制模式：拦截所有可绑定手柄按键并回调给设置弹窗，不触发常规页面操控。
+        val captureCallback = keyCaptureCallback
+        if (captureCallback != null && keyCode in GamepadKeyCodes.ALL_BINDABLE_KEYS) {
+            if (isFirstDown) {
+                captureCallback(keyCode)
+            }
+            return true
+        }
+
+        if (!_uiState.value.pluginEnabled) return false
+
+        // 十字键始终走方向导航/播放微调，不参与自定义按键槽位。
+        if (keyCode in DPAD_KEYCODES) {
+            if (isDown) {
+                val direction = when (keyCode) {
+                    KeyEvent.KEYCODE_DPAD_UP -> GamepadDirection.UP
+                    KeyEvent.KEYCODE_DPAD_DOWN -> GamepadDirection.DOWN
+                    KeyEvent.KEYCODE_DPAD_LEFT -> GamepadDirection.LEFT
+                    else -> GamepadDirection.RIGHT
+                }
+                dispatchDirectionAction(direction, fromDpad = true)
+            }
+            return true
+        }
+
         val state = _uiState.value
         val inVideo = isVideoScene(state.scene) && config.playerShortcutsEnabled
         val inFullscreen = state.scene == GamepadScene.VIDEO_FULLSCREEN && config.playerShortcutsEnabled
 
-        return when (keyCode) {
-            KeyEvent.KEYCODE_BUTTON_A -> {
+        val matchedSlot = resolveActionSlotForKey(
+            config = config,
+            keyCode = keyCode,
+            inVideo = inVideo,
+            effectiveProfile = state.effectiveProfile,
+        )
+
+        if (matchedSlot != null) {
+            return handleActionSlotKey(
+                slot = matchedSlot,
+                keyCode = keyCode,
+                isFirstDown = isFirstDown,
+                isUp = isUp,
+                state = state,
+                inVideo = inVideo,
+                inFullscreen = inFullscreen,
+            )
+        }
+
+        // Switch Pro / 部分第三方手柄的 L2/R2(ZL/ZR) 仅上报数字键而不上报模拟轴，
+        // 当用户未将其绑定到其他自定义动作时，作为左/右扳机数字输入无缝接入精准瞄准与倍速。
+        if (keyCode == KeyEvent.KEYCODE_BUTTON_L2 || keyCode == KeyEvent.KEYCODE_BUTTON_R2) {
+            if (isDown || isUp) {
+                if (keyCode == KeyEvent.KEYCODE_BUTTON_L2) {
+                    digitalL2Pressed = isDown
+                } else {
+                    digitalR2Pressed = isDown
+                }
+                refreshEffectiveTriggerValues()
+            }
+            return true
+        }
+
+        return false
+    }
+
+    private fun handleActionSlotKey(
+        slot: GamepadActionSlot,
+        keyCode: Int,
+        isFirstDown: Boolean,
+        isUp: Boolean,
+        state: GamepadUiState,
+        inVideo: Boolean,
+        inFullscreen: Boolean,
+    ): Boolean {
+        val seekMs = config.seekStepSeconds.coerceIn(3, 60) * 1_000L
+        return when (slot) {
+            GamepadActionSlot.CONFIRM -> {
                 if (inFullscreen && !state.cursorVisible && state.mode == GamepadControlMode.CURSOR) {
                     if (isFirstDown) {
                         emitPlayerAction(GamepadPlayerAction.PlayPause)
@@ -326,7 +431,7 @@ object GamepadControlEngine {
                 }
             }
 
-            KeyEvent.KEYCODE_BUTTON_B -> {
+            GamepadActionSlot.BACK -> {
                 if (isFirstDown) {
                     releasePointerIfPressed()
                     windowBridge.dispatchBack()
@@ -335,170 +440,188 @@ object GamepadControlEngine {
                 true
             }
 
-            KeyEvent.KEYCODE_BUTTON_X -> {
-                if (isFirstDown) {
-                    if (inVideo) {
-                        emitPlayerAction(GamepadPlayerAction.ToggleDanmaku)
-                    } else {
-                        _navigationActions.tryEmit(GamepadNavigationAction.OpenSearch)
-                    }
-                }
-                true
-            }
-
-            KeyEvent.KEYCODE_BUTTON_Y -> {
-                if (isFirstDown) {
-                    yLongPressFired = false
-                    if (inVideo) {
-                        mainHandler.removeCallbacks(yLongPressRunnable)
-                        mainHandler.postDelayed(yLongPressRunnable, LONG_PRESS_Y_MS)
-                    } else {
-                        _navigationActions.tryEmit(GamepadNavigationAction.ReselectCurrentTab)
-                    }
-                } else if (isUp) {
-                    mainHandler.removeCallbacks(yLongPressRunnable)
-                    if (inVideo && !yLongPressFired) {
-                        emitPlayerAction(GamepadPlayerAction.ToggleFullscreen)
-                    }
-                    yLongPressFired = false
-                }
-                true
-            }
-
-            KeyEvent.KEYCODE_BUTTON_L1 -> {
-                if (isFirstDown) {
-                    if (inVideo) {
-                        if (ltPressed) {
-                            emitPlayerAction(GamepadPlayerAction.PreviousPart)
-                        } else {
-                            emitPlayerAction(GamepadPlayerAction.SeekRelative(-10_000L))
-                        }
-                    } else {
-                        _navigationActions.tryEmit(GamepadNavigationAction.SwitchBottomTabDelta(-1))
-                    }
-                }
-                true
-            }
-
-            KeyEvent.KEYCODE_BUTTON_R1 -> {
-                if (isFirstDown) {
-                    if (inVideo) {
-                        if (ltPressed) {
-                            emitPlayerAction(GamepadPlayerAction.NextPart)
-                        } else {
-                            emitPlayerAction(GamepadPlayerAction.SeekRelative(10_000L))
-                        }
-                    } else {
-                        _navigationActions.tryEmit(GamepadNavigationAction.SwitchBottomTabDelta(+1))
-                    }
-                }
-                true
-            }
-
-            KeyEvent.KEYCODE_BUTTON_START -> {
-                if (isFirstDown) {
-                    if (inVideo) {
-                        emitPlayerAction(GamepadPlayerAction.PlayPause)
-                    } else {
-                        _navigationActions.tryEmit(GamepadNavigationAction.OpenSettings)
-                    }
-                }
-                true
-            }
-
-            KeyEvent.KEYCODE_BUTTON_SELECT -> {
+            GamepadActionSlot.TOGGLE_MODE -> {
                 if (isFirstDown) {
                     toggleControlMode()
                 }
                 true
             }
 
-            KeyEvent.KEYCODE_BUTTON_THUMBL -> {
+            GamepadActionSlot.TOGGLE_CURSOR -> {
                 if (isFirstDown) {
                     toggleCursorVisibility()
                 }
                 true
             }
 
-            KeyEvent.KEYCODE_BUTTON_THUMBR -> {
+            GamepadActionSlot.TOGGLE_HUD -> {
                 if (isFirstDown) {
-                    if (inFullscreen && ltPressed) {
+                    val lockBound = resolveBoundKeyCode(
+                        config = config,
+                        slot = GamepadActionSlot.TOGGLE_SCREEN_LOCK,
+                        effectiveProfile = state.effectiveProfile,
+                    ) != GamepadKeyCodes.UNBOUND
+                    if (inFullscreen && ltPressed && !lockBound) {
                         emitPlayerAction(GamepadPlayerAction.ToggleScreenLock)
                     } else {
-                        val nextHud = !_uiState.value.hudVisible
-                        _uiState.update { it.copy(hudVisible = nextHud) }
-                        showBanner(if (nextHud) "已显示手柄键位提示" else "已隐藏手柄键位提示")
+                        val nextHud = !config.showLegendHud
+                        val updatedConfig = config.copy(showLegendHud = nextHud)
+                        updateConfig(updatedConfig)
+                        configPersistCallback?.invoke(updatedConfig)
+                        showBanner(if (nextHud) "已显示底部提示栏" else "已隐藏底部提示栏")
                     }
                 }
                 true
             }
 
-            KeyEvent.KEYCODE_DPAD_UP,
-            KeyEvent.KEYCODE_DPAD_DOWN,
-            KeyEvent.KEYCODE_DPAD_LEFT,
-            KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                if (isDown) {
-                    val direction = when (keyCode) {
-                        KeyEvent.KEYCODE_DPAD_UP -> GamepadDirection.UP
-                        KeyEvent.KEYCODE_DPAD_DOWN -> GamepadDirection.DOWN
-                        KeyEvent.KEYCODE_DPAD_LEFT -> GamepadDirection.LEFT
-                        else -> GamepadDirection.RIGHT
-                    }
-                    dispatchDirectionAction(direction, fromDpad = true)
+            GamepadActionSlot.OPEN_SEARCH -> {
+                if (isFirstDown) {
+                    _navigationActions.tryEmit(GamepadNavigationAction.OpenSearch)
                 }
                 true
             }
 
-            KeyEvent.KEYCODE_BUTTON_L2,
-            KeyEvent.KEYCODE_BUTTON_R2 -> true
+            GamepadActionSlot.REFRESH_OR_TOP -> {
+                if (isFirstDown) {
+                    _navigationActions.tryEmit(GamepadNavigationAction.ReselectCurrentTab)
+                }
+                true
+            }
 
-            else -> false
+            GamepadActionSlot.PREV_TAB -> {
+                if (isFirstDown) {
+                    _navigationActions.tryEmit(GamepadNavigationAction.SwitchBottomTabDelta(-1))
+                }
+                true
+            }
+
+            GamepadActionSlot.NEXT_TAB -> {
+                if (isFirstDown) {
+                    _navigationActions.tryEmit(GamepadNavigationAction.SwitchBottomTabDelta(+1))
+                }
+                true
+            }
+
+            GamepadActionSlot.OPEN_SETTINGS -> {
+                if (isFirstDown) {
+                    _navigationActions.tryEmit(GamepadNavigationAction.OpenSettings)
+                }
+                true
+            }
+
+            GamepadActionSlot.PLAY_PAUSE -> {
+                if (isFirstDown) {
+                    emitPlayerAction(GamepadPlayerAction.PlayPause)
+                }
+                true
+            }
+
+            GamepadActionSlot.TOGGLE_DANMAKU -> {
+                if (isFirstDown) {
+                    emitPlayerAction(GamepadPlayerAction.ToggleDanmaku)
+                }
+                true
+            }
+
+            GamepadActionSlot.TOGGLE_FULLSCREEN -> {
+                if (isFirstDown) {
+                    fullscreenLongPressFired = false
+                    fullscreenLongPressKeyCode = keyCode
+                    if (inVideo) {
+                        mainHandler.removeCallbacks(fullscreenLongPressRunnable)
+                        mainHandler.postDelayed(fullscreenLongPressRunnable, LONG_PRESS_FULLSCREEN_MS)
+                    }
+                } else if (isUp && fullscreenLongPressKeyCode == keyCode) {
+                    mainHandler.removeCallbacks(fullscreenLongPressRunnable)
+                    if (inVideo && !fullscreenLongPressFired) {
+                        emitPlayerAction(GamepadPlayerAction.ToggleFullscreen)
+                    }
+                    fullscreenLongPressFired = false
+                    fullscreenLongPressKeyCode = GamepadKeyCodes.UNBOUND
+                }
+                true
+            }
+
+            GamepadActionSlot.SEEK_BACKWARD -> {
+                if (isFirstDown) {
+                    if (ltPressed) {
+                        emitPlayerAction(GamepadPlayerAction.PreviousPart)
+                    } else {
+                        emitPlayerAction(GamepadPlayerAction.SeekRelative(-seekMs))
+                    }
+                }
+                true
+            }
+
+            GamepadActionSlot.SEEK_FORWARD -> {
+                if (isFirstDown) {
+                    if (ltPressed) {
+                        emitPlayerAction(GamepadPlayerAction.NextPart)
+                    } else {
+                        emitPlayerAction(GamepadPlayerAction.SeekRelative(seekMs))
+                    }
+                }
+                true
+            }
+
+            GamepadActionSlot.TOGGLE_MUTE -> {
+                if (isFirstDown) {
+                    emitPlayerAction(GamepadPlayerAction.ToggleMute)
+                    showBanner("切换静音")
+                }
+                true
+            }
+
+            GamepadActionSlot.TOGGLE_LIKE -> {
+                if (isFirstDown) {
+                    emitPlayerAction(GamepadPlayerAction.ToggleLike)
+                    showBanner("点赞")
+                }
+                true
+            }
+
+            GamepadActionSlot.TOGGLE_SCREEN_LOCK -> {
+                if (isFirstDown) {
+                    emitPlayerAction(GamepadPlayerAction.ToggleScreenLock)
+                }
+                true
+            }
         }
     }
 
     fun handleGenericMotionEvent(event: MotionEvent): Boolean {
         if (windowBridge.isDispatchingSynthetic) return false
-        if (!_uiState.value.pluginEnabled) return false
         if (event.action != MotionEvent.ACTION_MOVE) return false
         val isJoystick = event.isFromSource(InputDevice.SOURCE_JOYSTICK) ||
             event.isFromSource(InputDevice.SOURCE_GAMEPAD)
         if (!isJoystick) return false
 
         val device = event.device
-        if (device != null && isHardwareGamepadDevice(device) && !_uiState.value.connected) {
-            refreshConnectedControllers(notifyChange = false)
+        if (device != null && isHardwareGamepadDevice(device)) {
+            syncActiveControllerDevice(device)
         }
 
+        // 即使处于按键录制态或插件关闭，也保持遥测更新方便设置页测试仪查看，但仅在插件启用且非录制时执行操控。
         val rawLx = event.getAxisValue(MotionEvent.AXIS_X)
         val rawLy = event.getAxisValue(MotionEvent.AXIS_Y)
-        val (rawRx, rawRy) = extractRightStickAxes(event, device)
+        val (rawRx, rawRy, parsedLt, parsedRt) = extractRightStickAndTriggers(event, device)
         rawHatX = event.getAxisValue(MotionEvent.AXIS_HAT_X)
         rawHatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
 
-        leftTriggerValue = resolveTriggerValue(
-            primaryAxis = event.getAxisValue(MotionEvent.AXIS_LTRIGGER),
-            fallbackAxis = event.getAxisValue(MotionEvent.AXIS_BRAKE),
-        )
-        rightTriggerValue = resolveTriggerValue(
-            primaryAxis = event.getAxisValue(MotionEvent.AXIS_RTRIGGER),
-            fallbackAxis = event.getAxisValue(MotionEvent.AXIS_GAS),
-        )
+        analogLeftTriggerValue = parsedLt
+        analogRightTriggerValue = parsedRt
 
         leftStick = normalizeRadialStick(rawLx, rawLy, config.stickDeadzone)
         rightStick = normalizeRadialStick(rawRx, rawRy, config.stickDeadzone)
 
-        _telemetry.update {
-            it.copy(
-                leftX = leftStick.x,
-                leftY = leftStick.y,
-                rightX = rightStick.x,
-                rightY = rightStick.y,
-                leftTrigger = leftTriggerValue,
-                rightTrigger = rightTriggerValue,
-            )
+        if (keyCaptureCallback != null || !_uiState.value.pluginEnabled) {
+            leftTriggerValue = resolveMultiControllerTriggerValue(analogLeftTriggerValue, digitalL2Pressed)
+            rightTriggerValue = resolveMultiControllerTriggerValue(analogRightTriggerValue, digitalR2Pressed)
+            publishTelemetry()
+            return keyCaptureCallback != null
         }
 
-        updateTriggerStates()
+        refreshEffectiveTriggerValues()
 
         val hatDirection = resolveDominantDirection(rawHatX, rawHatY)
         hatRepeatTracker.update(hatDirection, SystemClock.uptimeMillis())?.let { dir ->
@@ -510,7 +633,8 @@ object GamepadControlEngine {
             wakeCursor()
         }
 
-        if (!rightStick.isActive) {
+        if (!rightStick.isActive && !(rtPressed && !isVideoScene(_uiState.value.scene))) {
+            lockedScrollAxis = null
             windowBridge.finishScrollDragIfActive()
         }
 
@@ -520,13 +644,106 @@ object GamepadControlEngine {
         return true
     }
 
-    private fun extractRightStickAxes(event: MotionEvent, device: InputDevice?): Pair<Float, Float> {
-        val hasZ = device?.getMotionRange(MotionEvent.AXIS_Z, InputDevice.SOURCE_JOYSTICK) != null
-        val hasRz = device?.getMotionRange(MotionEvent.AXIS_RZ, InputDevice.SOURCE_JOYSTICK) != null
-        return if (hasZ || hasRz || device == null) {
-            event.getAxisValue(MotionEvent.AXIS_Z) to event.getAxisValue(MotionEvent.AXIS_RZ)
+    private data class RightStickAndTriggers(
+        val rightX: Float,
+        val rightY: Float,
+        val leftTrigger: Float,
+        val rightTrigger: Float,
+    )
+
+    /**
+     * 兼容多品牌手柄的右摇杆与模拟扳机轴提取：
+     * - 标准 Xbox / DualSense / 通用：右摇杆使用 `AXIS_Z / AXIS_RZ`，扳机使用 `AXIS_LTRIGGER / AXIS_RTRIGGER` 或 `AXIS_BRAKE / AXIS_GAS`；
+     * - 部分 PlayStation DualShock 4 / DualSense 蓝牙驱动：右摇杆用 `Z / RZ`，但 L2 / R2 上报在 `AXIS_RX / AXIS_RY` 且量程为 `[-1, 1]`（松开为 -1）；
+     * - 仅具备 `RX / RY` 的老手柄：右摇杆回退到 `AXIS_RX / AXIS_RY`。
+     */
+    private fun extractRightStickAndTriggers(
+        event: MotionEvent,
+        device: InputDevice?,
+    ): RightStickAndTriggers {
+        val zRange = device?.getMotionRange(MotionEvent.AXIS_Z, InputDevice.SOURCE_JOYSTICK)
+        val rzRange = device?.getMotionRange(MotionEvent.AXIS_RZ, InputDevice.SOURCE_JOYSTICK)
+        val rxRange = device?.getMotionRange(MotionEvent.AXIS_RX, InputDevice.SOURCE_JOYSTICK)
+        val ryRange = device?.getMotionRange(MotionEvent.AXIS_RY, InputDevice.SOURCE_JOYSTICK)
+        val hasZRightStick = zRange != null || rzRange != null || device == null
+
+        val rightX = if (hasZRightStick) {
+            event.getAxisValue(MotionEvent.AXIS_Z)
         } else {
-            event.getAxisValue(MotionEvent.AXIS_RX) to event.getAxisValue(MotionEvent.AXIS_RY)
+            event.getAxisValue(MotionEvent.AXIS_RX)
+        }
+        val rightY = if (hasZRightStick) {
+            event.getAxisValue(MotionEvent.AXIS_RZ)
+        } else {
+            event.getAxisValue(MotionEvent.AXIS_RY)
+        }
+
+        val lTriggerRange = device?.getMotionRange(MotionEvent.AXIS_LTRIGGER, InputDevice.SOURCE_JOYSTICK)
+        val brakeRange = device?.getMotionRange(MotionEvent.AXIS_BRAKE, InputDevice.SOURCE_JOYSTICK)
+        val rTriggerRange = device?.getMotionRange(MotionEvent.AXIS_RTRIGGER, InputDevice.SOURCE_JOYSTICK)
+        val gasRange = device?.getMotionRange(MotionEvent.AXIS_GAS, InputDevice.SOURCE_JOYSTICK)
+
+        var lt = resolveTriggerValue(
+            primaryAxis = readNormalizedTriggerAxis(event, MotionEvent.AXIS_LTRIGGER, lTriggerRange),
+            fallbackAxis = readNormalizedTriggerAxis(event, MotionEvent.AXIS_BRAKE, brakeRange),
+        )
+        var rt = resolveTriggerValue(
+            primaryAxis = readNormalizedTriggerAxis(event, MotionEvent.AXIS_RTRIGGER, rTriggerRange),
+            fallbackAxis = readNormalizedTriggerAxis(event, MotionEvent.AXIS_GAS, gasRange),
+        )
+
+        // Sony DualShock 4 / 部分 DualSense 蓝牙映射：无标准 LTRIGGER/BRAKE 轴，改用 RX/RY [-1..1] 表示 L2/R2。
+        if (hasZRightStick && lTriggerRange == null && brakeRange == null && rxRange != null) {
+            lt = max(lt, normalizeAxisToUnitRange(event.getAxisValue(MotionEvent.AXIS_RX), rxRange.min, rxRange.max))
+        }
+        if (hasZRightStick && rTriggerRange == null && gasRange == null && ryRange != null) {
+            rt = max(rt, normalizeAxisToUnitRange(event.getAxisValue(MotionEvent.AXIS_RY), ryRange.min, ryRange.max))
+        }
+
+        return RightStickAndTriggers(
+            rightX = rightX,
+            rightY = rightY,
+            leftTrigger = lt,
+            rightTrigger = rt,
+        )
+    }
+
+    private fun readNormalizedTriggerAxis(
+        event: MotionEvent,
+        axis: Int,
+        range: InputDevice.MotionRange?,
+    ): Float {
+        if (range == null) return event.getAxisValue(axis).coerceIn(0f, 1f)
+        val raw = event.getAxisValue(axis)
+        return if (range.min < -0.05f) {
+            normalizeAxisToUnitRange(raw, range.min, range.max)
+        } else {
+            raw.coerceIn(0f, 1f)
+        }
+    }
+
+    private fun refreshEffectiveTriggerValues() {
+        leftTriggerValue = resolveMultiControllerTriggerValue(analogLeftTriggerValue, digitalL2Pressed)
+        rightTriggerValue = resolveMultiControllerTriggerValue(analogRightTriggerValue, digitalR2Pressed)
+        publishTelemetry()
+        updateTriggerStates()
+        if (shouldKeepFrameLoopRunning()) {
+            startFrameLoop()
+        }
+    }
+
+    private fun publishTelemetry() {
+        // 仅在设置页测试仪活跃订阅时推送遥测，避免高频摇杆采样在正常浏览滑动时产生多余对象分配。
+        if (_telemetry.subscriptionCount.value <= 0) return
+        _telemetry.update {
+            it.copy(
+                leftX = leftStick.x,
+                leftY = leftStick.y,
+                rightX = rightStick.x,
+                rightY = rightStick.y,
+                leftTrigger = leftTriggerValue,
+                rightTrigger = rightTriggerValue,
+            )
         }
     }
 
@@ -547,7 +764,8 @@ object GamepadControlEngine {
                 rtSpeedBoostActive = true
                 _uiState.update { it.copy(rtBoostActive = true) }
                 emitPlayerAction(GamepadPlayerAction.SpeedBoostChanged(active = true, speed = config.rtBoostSpeed))
-                showBanner("${config.rtBoostSpeed}x 倍速中（松开 RT 恢复）")
+                val (_, rtLabel) = formatTriggerPairLabels(state.effectiveProfile)
+                showBanner("${config.rtBoostSpeed}x 倍速中（松开 $rtLabel 恢复）")
             } else if (!nextRt && rtSpeedBoostActive) {
                 rtSpeedBoostActive = false
                 _uiState.update { it.copy(rtBoostActive = false) }
@@ -562,7 +780,7 @@ object GamepadControlEngine {
         val nowMs = SystemClock.uptimeMillis()
         val density = windowBridge.currentActivity()?.resources?.displayMetrics?.density ?: 2f
 
-        // 1. 蓝牙 Xbox 十字键（HAT 轴）长按连发
+        // 1. 蓝牙手柄十字键（HAT 轴）长按连发
         val hatDirection = resolveDominantDirection(rawHatX, rawHatY)
         hatRepeatTracker.update(hatDirection, nowMs)?.let { dir ->
             dispatchDirectionAction(dir, fromDpad = true)
@@ -614,11 +832,13 @@ object GamepadControlEngine {
             leftStickFocusRepeatTracker.reset()
         }
 
-        // 3. 右摇杆（及浏览模式下 RT 加速向下滚动）
+        // 3. 右摇杆（及浏览模式下右扳机加速向下滚动）
         val inFullscreenNoCursor = state.scene == GamepadScene.VIDEO_FULLSCREEN &&
             config.playerShortcutsEnabled &&
             !state.cursorVisible
         if (inFullscreenNoCursor && rightStick.isActive) {
+            lockedScrollAxis = null
+            windowBridge.finishScrollDragIfActive(cancel = true)
             if (abs(rightStick.y) >= abs(rightStick.x)) {
                 val deltaBrightness = -rightStick.y * dtSeconds * 0.75f
                 if (abs(deltaBrightness) > 0.004f) {
@@ -630,32 +850,42 @@ object GamepadControlEngine {
                 emitPlayerAction(GamepadPlayerAction.SeekRelative(deltaMs))
             }
         } else {
-            val effectiveRy = when {
+            val rawScrollY = when {
                 rightStick.isActive -> rightStick.y
                 rtPressed && !isVideoScene(state.scene) -> rightTriggerValue.coerceAtLeast(0.65f)
                 else -> 0f
             }
-            val effectiveRx = if (rightStick.isActive) rightStick.x else 0f
-            if (effectiveRx != 0f || effectiveRy != 0f) {
+            val rawScrollX = if (rightStick.isActive) rightStick.x else 0f
+            val (nextAxis, lockedVector) = resolveLockedScrollVector(
+                rawX = rawScrollX,
+                rawY = rawScrollY,
+                currentAxis = lockedScrollAxis,
+            )
+            lockedScrollAxis = nextAxis
+            if (nextAxis != null && lockedVector.isActive) {
                 ensureCursorBoundsInitialized()
-                val sign = if (config.invertRightStickScroll) -1f else 1f
-                val scrollSpeed = config.scrollSensitivity.coerceIn(0.4f, 3.0f)
-                // Android AXIS_VSCROLL 正值=向上滚，右摇杆向下推（effectiveRy > 0）应向下滚（vScroll < 0）。
-                val vScroll = -effectiveRy * sign * scrollSpeed * 16f * dtSeconds
-                val hScroll = effectiveRx * scrollSpeed * 12f * dtSeconds
-                val fallbackDragDx = -effectiveRx * scrollSpeed * 620f * density * dtSeconds
-                val fallbackDragDy = -effectiveRy * sign * scrollSpeed * 760f * density * dtSeconds
-                val (viewportW, viewportH) = windowBridge.currentViewportSize()
-                val targetX = if (state.cursorVisible) cursorX else viewportW * 0.5f
-                val targetY = if (state.cursorVisible) cursorY else viewportH * 0.5f
-                windowBridge.injectScroll(
-                    screenX = targetX,
-                    screenY = targetY,
-                    hScrollUnits = hScroll,
-                    vScrollUnits = vScroll,
-                    fallbackDragDxPx = fallbackDragDx,
-                    fallbackDragDyPx = fallbackDragDy,
+                val (dxPx, dyPx) = computeScrollDragStepPx(
+                    lockedVector = lockedVector,
+                    deltaSeconds = dtSeconds,
+                    density = density,
+                    scrollSensitivity = config.scrollSensitivity,
+                    invertVertical = config.invertRightStickScroll,
                 )
+                // 始终锚定在当前光标坐标（cursorX, cursorY），光标在哪个模块，右摇杆就在该模块内滚动，
+                // 即使光标因静止自动淡出也不再跳回屏幕中央。
+                if (state.cursorVisible) {
+                    scheduleCursorAutoHide()
+                }
+                windowBridge.injectContinuousScroll(
+                    screenX = cursorX,
+                    screenY = cursorY,
+                    dxPx = dxPx,
+                    dyPx = dyPx,
+                    axis = nextAxis,
+                    density = density,
+                )
+            } else {
+                windowBridge.finishScrollDragIfActive()
             }
         }
     }
@@ -786,6 +1016,8 @@ object GamepadControlEngine {
             pressed = state.pointerPressed,
             precisionAim = state.precisionAimHeld,
             density = density,
+            cursorSize = config.cursorSize,
+            cursorColorStyle = config.cursorColorStyle,
         )
     }
 
@@ -806,26 +1038,68 @@ object GamepadControlEngine {
         }
     }
 
+    private fun syncActiveControllerDevice(device: InputDevice) {
+        val current = _uiState.value
+        val name = device.name?.takeIf { it.isNotBlank() }
+        val detected = detectControllerProfile(
+            vendorId = device.vendorId,
+            productId = device.productId,
+            deviceName = name.orEmpty(),
+        )
+        if (!current.connected ||
+            current.controllerName != name ||
+            current.controllerVendorId != device.vendorId ||
+            current.controllerProductId != device.productId ||
+            current.detectedProfile != detected
+        ) {
+            _uiState.update {
+                it.copy(
+                    connected = true,
+                    controllerName = name,
+                    controllerVendorId = device.vendorId,
+                    controllerProductId = device.productId,
+                    detectedProfile = detected,
+                    effectiveProfile = resolveEffectiveProfile(config.controllerProfileOverride, detected),
+                )
+            }
+        }
+    }
+
     private fun refreshConnectedControllers(notifyChange: Boolean) {
         val manager = inputManager ?: return
         val gamepad = manager.inputDeviceIds
             .asSequence()
             .mapNotNull { manager.getInputDevice(it) }
-            .firstOrNull { isHardwareGamepadDevice(it) }
+            .filter { isHardwareGamepadDevice(it) }
+            .sortedByDescending { scoreControllerDevice(it) }
+            .firstOrNull()
         val wasConnected = _uiState.value.connected
         val isNowConnected = gamepad != null
         val name = gamepad?.name?.takeIf { it.isNotBlank() }
+        val vendorId = gamepad?.vendorId ?: 0
+        val productId = gamepad?.productId ?: 0
+        val detected = if (gamepad != null) {
+            detectControllerProfile(vendorId = vendorId, productId = productId, deviceName = name.orEmpty())
+        } else {
+            GamepadControllerProfile.GENERIC
+        }
+        val effective = resolveEffectiveProfile(config.controllerProfileOverride, detected)
         _uiState.update {
             it.copy(
                 connected = isNowConnected,
                 controllerName = name,
+                controllerVendorId = vendorId,
+                controllerProductId = productId,
+                detectedProfile = detected,
+                effectiveProfile = effective,
             )
         }
         if (notifyChange && _uiState.value.pluginEnabled && wasConnected != isNowConnected) {
             if (isNowConnected) {
-                val label = name ?: "Xbox 手柄"
-                showBanner("已连接 $label")
-                Logger.d(TAG, "Gamepad connected: $label")
+                val brand = controllerProfileBadgeLabel(effective)
+                val label = name ?: "$brand 手柄"
+                showBanner("已连接 $brand · $label")
+                Logger.d(TAG, "Gamepad connected: $label (vid=$vendorId pid=$productId profile=$detected)")
             } else {
                 resetLiveInputs()
                 hideCursorInternal()
@@ -833,6 +1107,17 @@ object GamepadControlEngine {
                 Logger.d(TAG, "Gamepad disconnected")
             }
         }
+    }
+
+    /** 优先选择同时具备 SOURCE_GAMEPAD 与 SOURCE_JOYSTICK 的主手柄设备（避开 PS 手柄附带的触控板子设备）。 */
+    private fun scoreControllerDevice(device: InputDevice): Int {
+        var score = 0
+        val sources = device.sources
+        if ((sources and InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD) score += 2
+        if ((sources and InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK) score += 2
+        if (device.getMotionRange(MotionEvent.AXIS_X, InputDevice.SOURCE_JOYSTICK) != null) score += 1
+        if (device.name?.contains("touchpad", ignoreCase = true) == true) score -= 4
+        return score
     }
 
     private fun emitPlayerAction(action: GamepadPlayerAction) {
@@ -871,17 +1156,25 @@ object GamepadControlEngine {
         frameLoopRunning = false
         lastFrameNanos = 0L
         Choreographer.getInstance().removeFrameCallback(frameCallback)
+        lockedScrollAxis = null
+        windowBridge.finishScrollDragIfActive()
     }
 
     private fun resetLiveInputs() {
         stopFrameLoop()
-        mainHandler.removeCallbacks(yLongPressRunnable)
+        mainHandler.removeCallbacks(fullscreenLongPressRunnable)
         mainHandler.removeCallbacks(autoHideCursorRunnable)
-        yLongPressFired = false
+        fullscreenLongPressFired = false
+        fullscreenLongPressKeyCode = GamepadKeyCodes.UNBOUND
         leftStick = NormalizedStickVector()
         rightStick = NormalizedStickVector()
+        lockedScrollAxis = null
         rawHatX = 0f
         rawHatY = 0f
+        analogLeftTriggerValue = 0f
+        analogRightTriggerValue = 0f
+        digitalL2Pressed = false
+        digitalR2Pressed = false
         leftTriggerValue = 0f
         rightTriggerValue = 0f
         ltPressed = false
@@ -904,33 +1197,21 @@ object GamepadControlEngine {
     private fun isGamepadKeyEvent(event: KeyEvent): Boolean {
         val code = event.keyCode
         if (code in GAMEPAD_ONLY_KEYCODES) return true
-        if (code in DPAD_KEYCODES) {
-            val fromGamepad = event.isFromSource(InputDevice.SOURCE_GAMEPAD) ||
-                event.isFromSource(InputDevice.SOURCE_JOYSTICK)
-            return fromGamepad
-        }
+        val fromGamepad = event.isFromSource(InputDevice.SOURCE_GAMEPAD) ||
+            event.isFromSource(InputDevice.SOURCE_JOYSTICK)
+        if (code in DPAD_KEYCODES) return fromGamepad
+        if (code in GamepadKeyCodes.ALL_BINDABLE_KEYS) return fromGamepad
         return false
     }
 
     private fun recordLastButton(keyCode: Int) {
+        val profile = _uiState.value.effectiveProfile
         val label = when (keyCode) {
-            KeyEvent.KEYCODE_BUTTON_A -> "A 键"
-            KeyEvent.KEYCODE_BUTTON_B -> "B 键"
-            KeyEvent.KEYCODE_BUTTON_X -> "X 键"
-            KeyEvent.KEYCODE_BUTTON_Y -> "Y 键"
-            KeyEvent.KEYCODE_BUTTON_L1 -> "LB 键"
-            KeyEvent.KEYCODE_BUTTON_R1 -> "RB 键"
-            KeyEvent.KEYCODE_BUTTON_L2 -> "LT 键"
-            KeyEvent.KEYCODE_BUTTON_R2 -> "RT 键"
-            KeyEvent.KEYCODE_BUTTON_START -> "Menu / Start"
-            KeyEvent.KEYCODE_BUTTON_SELECT -> "View / Back"
-            KeyEvent.KEYCODE_BUTTON_THUMBL -> "L3（左摇杆按压）"
-            KeyEvent.KEYCODE_BUTTON_THUMBR -> "R3（右摇杆按压）"
             KeyEvent.KEYCODE_DPAD_UP -> "十字键 上"
             KeyEvent.KEYCODE_DPAD_DOWN -> "十字键 下"
             KeyEvent.KEYCODE_DPAD_LEFT -> "十字键 左"
             KeyEvent.KEYCODE_DPAD_RIGHT -> "十字键 右"
-            else -> KeyEvent.keyCodeToString(keyCode)
+            else -> formatGamepadKeyDisplayName(keyCode, profile)
         }
         _telemetry.update { it.copy(lastButtonLabel = label) }
     }
@@ -971,8 +1252,10 @@ object GamepadControlEngine {
     private val GAMEPAD_ONLY_KEYCODES = setOf(
         KeyEvent.KEYCODE_BUTTON_A,
         KeyEvent.KEYCODE_BUTTON_B,
+        KeyEvent.KEYCODE_BUTTON_C,
         KeyEvent.KEYCODE_BUTTON_X,
         KeyEvent.KEYCODE_BUTTON_Y,
+        KeyEvent.KEYCODE_BUTTON_Z,
         KeyEvent.KEYCODE_BUTTON_L1,
         KeyEvent.KEYCODE_BUTTON_R1,
         KeyEvent.KEYCODE_BUTTON_L2,
